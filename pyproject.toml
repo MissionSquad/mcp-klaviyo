@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "klaviyo-mcp-server-extended"
+version = "0.4.2"
+description = "Klaviyo MCP Server community fork adding template listing, campaign cloning, template cloning, and campaign-message template traversal tools"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Klaviyo Developer Experience Team", email = "developers@klaviyo.com" },
+]
+keywords = ["ai", "klaviyo ai", "mcp", "Klaviyo", "Klaviyo api"]
+requires-python = ">=3.13"
+dependencies = [
+    "faker>=37.4.0",
+    "fastmcp>=2.8.0,<3.0.0",
+    "httpx>=0.28.1",
+    "klaviyo-api>=19.0.2",
+    "orjson>=3.10.18",
+    "psutil>=7.0.0",
+    "requests>=2.32.4",
+]
+
+[project.scripts]
+klaviyo-mcp-server = "klaviyo_mcp_server.main:main"
+run-claude = "klaviyo_mcp_server.scripts.run_client_secure:run_claude"
+run-cursor = "klaviyo_mcp_server.scripts.run_client_secure:run_cursor"
+
+[tool.hatch.build.targets.wheel]
+packages = ["klaviyo_mcp_server"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "klaviyo_mcp_server",
+    "README.md",
+    "LICENSE",
+]
