@@ -1,0 +1,64 @@
+name: Build and Test
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths-ignore:
+      - '**.md'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build Package
+        run: uv build
+
+      - name: Verify Tools
+        run: |
+          uv run python - <<'PY'
+          import asyncio
+          import klaviyo_mcp_server.main  # noqa: F401
+          from klaviyo_mcp_server.server import mcp
+
+          EXPECTED_TOOLS = {
+              "klaviyo_get_email_templates",
+              "klaviyo_clone_email_template",
+              "klaviyo_get_messages_for_campaign",
+              "klaviyo_get_template_for_campaign_message",
+              "klaviyo_get_template_id_for_campaign_message",
+              "klaviyo_clone_campaign",
+          }
+
+          async def main() -> None:
+              tools = await mcp.get_tools()
+              missing = EXPECTED_TOOLS - set(tools)
+              if missing:
+                  raise AssertionError(f"Missing expected tools: {sorted(missing)}")
+
+              for tool_name in EXPECTED_TOOLS:
+                  schema = tools[tool_name].parameters
+                  if schema.get("type") != "object":
+                      raise AssertionError(f"{tool_name} has non-object schema: {schema}")
+
+              if tools["klaviyo_clone_campaign"].annotations.readOnlyHint is not False:
+                  raise AssertionError("klaviyo_clone_campaign must be marked as a write tool")
+
+              if tools["klaviyo_get_template_id_for_campaign_message"].annotations.readOnlyHint is not True:
+                  raise AssertionError("klaviyo_get_template_id_for_campaign_message must be marked read-only")
+
+          asyncio.run(main())
+          PY
