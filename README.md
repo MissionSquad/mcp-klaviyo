@@ -1,6 +1,6 @@
 # klaviyo-mcp-server-extended
 
-**A community fork of Klaviyo's official [`klaviyo-mcp-server`](https://pypi.org/project/klaviyo-mcp-server/) (v0.4.1) adding six tools that the official server does not expose.**
+**A community fork of Klaviyo's official [`klaviyo-mcp-server`](https://pypi.org/project/klaviyo-mcp-server/) (v0.4.1) adding missing campaign/template traversal tools plus universal content support that the official server does not expose.**
 
 This is an unofficial, unsupported patch. It layers the missing tools onto the official code without changing any existing behavior — everything that works in the official server continues to work identically here.
 
@@ -12,11 +12,11 @@ As of April 2026, the official Klaviyo MCP server (v0.4.1) does not expose tools
 2. Traverse from a campaign or campaign message to its associated template
 3. Clone a campaign or a template
 
-These gaps make it impossible to clone an email campaign end-to-end through the MCP server, even though the underlying REST API fully supports all of these operations and the bundled `klaviyo-api` Python SDK already has the methods wired up. This fork simply exposes them.
+These gaps make it impossible to clone an email campaign end-to-end through the MCP server or safely manage Klaviyo's newer reusable universal content blocks, even though the underlying REST API fully supports all of these operations and the bundled `klaviyo-api` Python SDK already has the methods wired up. This fork simply exposes them.
 
 ## Tools added
 
-All six tools are thin wrappers around methods that already exist in the official `klaviyo-api` SDK. They follow the same style conventions as the surrounding code (`@mcp_tool`, `get_klaviyo_client()`, `clean_result()`).
+These tools are thin wrappers around methods that already exist in the official `klaviyo-api` SDK. They follow the same style conventions as the surrounding code (`@mcp_tool`, `get_klaviyo_client()`, `clean_result()`).
 
 | Tool | Writes? | REST endpoint |
 |------|---------|---------------|
@@ -26,8 +26,29 @@ All six tools are thin wrappers around methods that already exist in the officia
 | `klaviyo_get_template_for_campaign_message` | no | `GET /api/campaign-messages/{id}/template` |
 | `klaviyo_get_template_id_for_campaign_message` | no | `GET /api/campaign-messages/{id}/relationships/template` |
 | `klaviyo_clone_campaign` | yes | `POST /api/campaign-clone` |
+| `klaviyo_get_universal_content_blocks` | no | `GET /api/template-universal-content` |
+| `klaviyo_get_universal_content_block` | no | `GET /api/template-universal-content/{id}` |
+| `klaviyo_create_universal_content_block` | yes | `POST /api/template-universal-content` |
+| `klaviyo_update_universal_content_block` | yes | `PATCH /api/template-universal-content/{id}` |
+| `klaviyo_delete_universal_content_block` | yes | `DELETE /api/template-universal-content/{id}` |
+| `klaviyo_get_universal_content_block_html` | no | `GET /api/template-universal-content/{id}` |
 
 All other tools from the official server are preserved unchanged.
+
+## Universal content workflow
+
+For Klaviyo's newer reusable template blocks:
+
+1. discover blocks with `klaviyo_get_universal_content_blocks`
+2. inspect a block with `klaviyo_get_universal_content_block`
+3. create or update reusable blocks with the universal content write tools
+4. embed the returned block ID into template HTML with:
+
+```html
+<div data-klaviyo-universal-block="block_id">&nbsp;<div>
+```
+
+Warning: updating or deleting a universal content block affects every template that uses it.
 
 ## Authentication
 
@@ -35,8 +56,8 @@ Identical to the official local server: private API key via the `PRIVATE_API_KEY
 
 The private API key needs the same scopes as the official server. For the new tools specifically:
 
-- `templates:read` — for `get_email_templates`, `get_template_for_campaign_message`
-- `templates:write` — for `clone_email_template`
+- `templates:read` — for `get_email_templates`, `get_template_for_campaign_message`, `get_universal_content_blocks`, `get_universal_content_block`, `get_universal_content_block_html`
+- `templates:write` — for `clone_email_template`, `create_universal_content_block`, `update_universal_content_block`, `delete_universal_content_block`
 - `campaigns:read` — for `get_messages_for_campaign`, `get_template_id_for_campaign_message`
 - `campaigns:write` — for `clone_campaign`
 
