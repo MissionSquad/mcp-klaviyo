@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "klaviyo-mcp-server-extended"
-version = "0.4.4"
+version = "0.4.5"
 description = "Klaviyo MCP Server community fork adding template listing, campaign cloning, template cloning, and campaign-message template traversal tools"
 readme = "README.md"
 license = { file = "LICENSE" }

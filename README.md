@@ -32,6 +32,10 @@ These tools are thin wrappers around methods that already exist in the official 
 | `klaviyo_update_universal_content_block` | yes | `PATCH /api/template-universal-content/{id}` |
 | `klaviyo_delete_universal_content_block` | yes | `DELETE /api/template-universal-content/{id}` |
 | `klaviyo_get_universal_content_block_html` | no | `GET /api/template-universal-content/{id}` |
+| `klaviyo_get_universal_content_blocks_for_template` | no | derived from template HTML + definition scan |
+| `klaviyo_get_universal_content_blocks_for_campaign` | no | derived from campaign messages -> template traversal |
+| `klaviyo_get_templates_using_universal_content_block` | no | derived reverse relationship scan |
+| `klaviyo_get_campaigns_using_universal_content_block` | no | derived reverse relationship scan |
 
 All other tools from the official server are preserved unchanged.
 
@@ -49,6 +53,13 @@ For Klaviyo's newer reusable template blocks:
 ```
 
 Warning: updating or deleting a universal content block affects every template that uses it.
+
+Relationship helpers are also available:
+
+- template -> universal content blocks
+- campaign -> universal content blocks
+- universal content block -> templates using it
+- universal content block -> campaigns using it
 
 ## Authentication
 
