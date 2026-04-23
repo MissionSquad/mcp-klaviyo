@@ -32,8 +32,12 @@ To add an editable text block, add the following within that region:
 To add an editable image block, add the following within that region:
 <div class="klaviyo-block klaviyo-image-block"></div>
 
-To add a universal content block, add the following within that region, replacing block_id with the ID of the universal content block:
+To add a universal content block, first discover or create the block with the universal content tools, then embed it using:
 <div data-klaviyo-universal-block="block_id">&nbsp;<div>
+
+Use get_universal_content_blocks to find an existing reusable block by name or type.
+Use create_universal_content_block to create a new reusable block.
+Use get_universal_content_block before update_universal_content_block so you can preserve the full definition when editing an existing block.
 """
 
 
@@ -146,6 +150,8 @@ def get_email_templates(
 
     Use this tool to discover available templates when the user wants to clone an existing campaign, browse templates, or identify a template by name. Results are paginated.
 
+    If a template uses universal content blocks, manage those reusable blocks with the universal content tools instead of editing the block HTML inline.
+
     You can view and edit a template in the Klaviyo UI at https://www.klaviyo.com/email-editor/{TEMPLATE_ID}/edit."""
     response = get_klaviyo_client().Templates.get_templates(
         fields_template=fields,
@@ -168,6 +174,8 @@ def clone_email_template(
     ] = None,
 ) -> dict:
     """Clones an existing email template into a new template. Returns the ID of the new template.
+
+    Cloning a template does not replace the need to inspect referenced universal content blocks separately if the user wants to change reusable block behavior account-wide.
 
     You can view and edit the new template in the Klaviyo UI at https://www.klaviyo.com/email-editor/{TEMPLATE_ID}/edit."""
     attributes = {}
