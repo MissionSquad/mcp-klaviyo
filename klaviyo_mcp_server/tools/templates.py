@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
@@ -95,6 +95,78 @@ GetEmailTemplatesSort = Literal[
     "-updated",
 ]
 
+DEFAULT_COMPACT_TEMPLATE_FIELDS = ["name", "editor_type", "created", "updated"]
+CONTENT_TEMPLATE_FIELDS = ["html", "text", "amp"]
+EMAIL_TEMPLATE_FIELD_VALUES = {
+    "name",
+    "editor_type",
+    "html",
+    "text",
+    "amp",
+    "created",
+    "updated",
+}
+
+
+def _error_response(message: str, **details: Any) -> dict:
+    response = {
+        "ok": False,
+        "error": message,
+    }
+    response.update(details)
+    return response
+
+
+def _coerce_template_fields(
+    value: Any,
+    include_content: bool,
+    field_name: str = "fields",
+) -> tuple[list[str] | None, dict | None]:
+    if value is None:
+        selected = list(DEFAULT_COMPACT_TEMPLATE_FIELDS)
+        if include_content:
+            selected.extend(CONTENT_TEMPLATE_FIELDS)
+        return selected, None
+
+    raw_items: list[Any]
+    if isinstance(value, str):
+        raw_items = [value]
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        return None, _error_response(
+            f"`{field_name}` must be a string or an array of strings.",
+            received_type=type(value).__name__,
+            example={"fields": ["name", "created"]},
+        )
+
+    items: list[str] = []
+    invalid_items: list[Any] = []
+    for item in raw_items:
+        if not isinstance(item, str):
+            invalid_items.append(item)
+            continue
+        normalized = item.strip()
+        if not normalized:
+            continue
+        items.append(normalized)
+
+    if invalid_items:
+        return None, _error_response(
+            f"`{field_name}` must contain only strings.",
+            invalid_items=invalid_items,
+        )
+
+    invalid_values = [item for item in items if item not in EMAIL_TEMPLATE_FIELD_VALUES]
+    if invalid_values:
+        return None, _error_response(
+            f"`{field_name}` contains unsupported values.",
+            invalid_values=invalid_values,
+            allowed_values=sorted(EMAIL_TEMPLATE_FIELD_VALUES),
+        )
+
+    return items or list(DEFAULT_COMPACT_TEMPLATE_FIELDS), None
+
 
 @mcp_tool(has_writes=True)
 def create_email_template(
@@ -130,18 +202,64 @@ def create_email_template(
 @mcp_tool(has_writes=False)
 def get_email_template(
     template_id: Annotated[str, Field(description="The ID of the template return")],
+    fields: Annotated[
+        Any,
+        Field(
+            description=(
+                "Optional fields to return. Prefer a single string or an array of strings. "
+                "By default this tool returns compact metadata only: `name`, `editor_type`, "
+                "`created`, and `updated`."
+            )
+        ),
+    ] = None,
+    include_content: Annotated[
+        bool,
+        Field(
+            description=(
+                "If true and `fields` is omitted, also include the bulky content fields `html`, "
+                "`text`, and `amp`. Leave false for normal LLM calls to avoid context overflow."
+            )
+        ),
+    ] = False,
 ) -> dict:
-    """Get an email template with the given data. Returns attributes including the html or amp.
+    """Get an email template with the given data.
+
+    By default this tool returns compact metadata only to avoid large HTML-heavy responses. Set `include_content=true` or request explicit `fields` only when you really need `html`, `text`, or `amp`.
 
     You can view and edit a template in the Klaviyo UI at https://www.klaviyo.com/email-editor/{TEMPLATE_ID}/edit."""
-    response = get_klaviyo_client().Templates.get_template(template_id)
+    resolved_fields, error = _coerce_template_fields(fields, include_content)
+    if error:
+        return error
+
+    response = get_klaviyo_client().Templates.get_template(
+        template_id,
+        fields_template=resolved_fields,
+    )
     clean_result(response["data"])
     return response["data"]
 
 
 @mcp_tool(has_writes=False)
 def get_email_templates(
-    fields: FieldsParam[GetEmailTemplatesFields] = None,
+    fields: Annotated[
+        Any,
+        Field(
+            description=(
+                "Optional fields to return. Prefer a single string or an array of strings. "
+                "By default this tool returns compact metadata only: `name`, `editor_type`, "
+                "`created`, and `updated`."
+            )
+        ),
+    ] = None,
+    include_content: Annotated[
+        bool,
+        Field(
+            description=(
+                "If true and `fields` is omitted, also include `html`, `text`, and `amp`. "
+                "Leave false for normal discovery calls to avoid context overflow."
+            )
+        ),
+    ] = False,
     filters: FilterParam[GetEmailTemplatesFilter] = None,
     sort: SortParam[GetEmailTemplatesSort] = None,
     page_cursor: PageCursorParam = None,
@@ -150,11 +268,17 @@ def get_email_templates(
 
     Use this tool to discover available templates when the user wants to clone an existing campaign, browse templates, or identify a template by name. Results are paginated.
 
+    By default this tool returns compact metadata only to avoid large HTML-heavy responses. Request explicit `fields` or set `include_content=true` only when you really need `html`, `text`, or `amp`.
+
     If a template uses universal content blocks, manage those reusable blocks with the universal content tools instead of editing the block HTML inline.
 
     You can view and edit a template in the Klaviyo UI at https://www.klaviyo.com/email-editor/{TEMPLATE_ID}/edit."""
+    resolved_fields, error = _coerce_template_fields(fields, include_content)
+    if error:
+        return error
+
     response = get_klaviyo_client().Templates.get_templates(
-        fields_template=fields,
+        fields_template=resolved_fields,
         filter=get_filter_string(filters),
         sort=sort,
         page_cursor=page_cursor,
