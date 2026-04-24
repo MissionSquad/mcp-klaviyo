@@ -34,8 +34,6 @@ These tools are thin wrappers around methods that already exist in the official 
 | `klaviyo_get_universal_content_block_html` | no | `GET /api/template-universal-content/{id}` |
 | `klaviyo_get_universal_content_blocks_for_template` | no | derived from template HTML + definition scan |
 | `klaviyo_get_universal_content_blocks_for_campaign` | no | derived from campaign messages -> template traversal |
-| `klaviyo_get_templates_using_universal_content_block` | no | derived reverse relationship scan |
-| `klaviyo_get_campaigns_using_universal_content_block` | no | derived reverse relationship scan |
 
 All other tools from the official server are preserved unchanged.
 
@@ -58,10 +56,6 @@ Relationship helpers are also available:
 
 - template -> universal content blocks
 - campaign -> universal content blocks
-- universal content block -> templates using it
-- universal content block -> campaigns using it
-
-Reverse-usage relationship tools are paged so they can handle larger accounts without returning oversized responses.
 
 ## Authentication
 
@@ -139,7 +133,7 @@ After restarting your MCP client, your tool list should include the six new tool
 ## Upstream relationship
 
 - Based on `klaviyo-mcp-server==0.4.1` from PyPI (published 2026-03-05)
-- Version `0.4.6`, based on the upstream `0.4.1` base plus added campaign/template traversal, universal content, relationship, cache, and paged reverse-usage support
+- Version `0.4.7`, based on the upstream `0.4.1` base plus added campaign/template traversal, universal content, and forward relationship support
 - No changes to existing tools, models, utilities, prompts, or scripts
 - The added tools are the only diff
 
