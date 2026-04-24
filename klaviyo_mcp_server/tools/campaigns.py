@@ -19,7 +19,6 @@ from klaviyo_mcp_server.utils.param_types import (
     create_filter_models,
 )
 from klaviyo_mcp_server.utils.tool_decorator import mcp_tool
-from klaviyo_mcp_server.tools.universal_content import relationship_cache
 from klaviyo_mcp_server.utils.utils import (
     clean_result,
     get_filter_string,
@@ -244,7 +243,6 @@ def create_campaign(
             tracking_options.value.model_dump(exclude_none=True)
         )
     response = get_klaviyo_client().Campaigns.create_campaign(body)
-    relationship_cache.invalidate_all_campaigns()
 
     clean_result(
         response["data"]["relationships"]
@@ -283,7 +281,6 @@ def assign_template_to_campaign_message(
         }
     )
     clean_result(response["data"])
-    relationship_cache.invalidate_all_campaigns()
     return response
 
 
@@ -369,5 +366,4 @@ def clone_campaign(
     }
     response = get_klaviyo_client().Campaigns.create_campaign_clone(body)
     response["data"].pop("links", None)
-    relationship_cache.invalidate_all_campaigns()
     return response
