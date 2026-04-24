@@ -17,6 +17,7 @@ from klaviyo_mcp_server.utils.utils import (
     get_klaviyo_client,
 )
 from klaviyo_mcp_server.utils.tool_decorator import mcp_tool
+from klaviyo_mcp_server.tools.universal_content import relationship_cache
 
 HTML_PARAM_DESCRIPTION = """
 The complete HTML of the template. Should include <html> and <body> tags.
@@ -194,6 +195,7 @@ def create_email_template(
     }
     response = get_klaviyo_client().Templates.create_template(body)
     template_id = response["data"]["id"]
+    relationship_cache.invalidate_all_templates()
     return {
         "id": template_id,
     }
@@ -314,4 +316,5 @@ def clone_email_template(
     }
     response = get_klaviyo_client().Templates.clone_template(body)
     new_template_id = response["data"]["id"]
+    relationship_cache.invalidate_all_templates()
     return {"id": new_template_id}

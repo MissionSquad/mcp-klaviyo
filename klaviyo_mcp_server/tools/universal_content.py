@@ -1,5 +1,10 @@
+import base64
 import json
+import logging
 import re
+from dataclasses import dataclass, field
+from threading import RLock, Thread
+from time import monotonic, sleep
 from types import SimpleNamespace
 from typing import Annotated, Any, Literal
 
@@ -63,11 +68,80 @@ UNIVERSAL_CONTENT_ERROR_EXAMPLES = {
     },
 }
 
-TEMPLATE_USAGE_FIELDS = ["name", "editor_type", "html", "created", "updated"]
+TEMPLATE_DISCOVERY_FIELDS = ["name", "editor_type", "created", "updated"]
+TEMPLATE_USAGE_DETAIL_FIELDS = ["name", "editor_type", "html", "created", "updated"]
 CAMPAIGN_USAGE_FIELDS = ["name", "status", "created_at", "scheduled_at", "updated_at"]
 UNIVERSAL_BLOCK_REGEX = re.compile(
     r'data-klaviyo-universal-block\s*=\s*["\']([^"\']+)["\']'
 )
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TemplateUsageCacheEntry:
+    template_id: str
+    summary: dict[str, Any]
+    updated: str | None
+    universal_content_ids: list[str]
+    detection_sources: list[str]
+    refreshed_at_monotonic: float
+    error: str | None = None
+
+
+@dataclass
+class CampaignUsageReference:
+    campaign_message: dict[str, Any]
+    template_id: str | None
+    error: str | None = None
+
+
+@dataclass
+class CampaignUsageCacheEntry:
+    campaign_id: str
+    summary: dict[str, Any]
+    updated_at: str | None
+    references: list[CampaignUsageReference] = field(default_factory=list)
+    refreshed_at_monotonic: float = 0.0
+    error: str | None = None
+
+
+def _encode_cursor(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_cursor(
+    cursor: str | None,
+    *,
+    expected_kind: str,
+    expected_universal_content_id: str,
+) -> tuple[dict[str, Any] | None, dict | None]:
+    if cursor is None:
+        return None, None
+    try:
+        decoded = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+        payload = json.loads(decoded)
+    except Exception as error:
+        return None, _error_response(
+            "`page_cursor` is invalid.",
+            details=_exception_message(error if isinstance(error, Exception) else Exception(str(error))),
+        )
+    if not isinstance(payload, dict):
+        return None, _error_response("`page_cursor` is invalid.")
+    if payload.get("kind") != expected_kind:
+        return None, _error_response(
+            "`page_cursor` does not belong to this relationship tool.",
+            expected_kind=expected_kind,
+            received_kind=payload.get("kind"),
+        )
+    if payload.get("universal_content_id") != expected_universal_content_id:
+        return None, _error_response(
+            "`page_cursor` does not match the requested universal content block.",
+            expected_universal_content_id=expected_universal_content_id,
+            received_universal_content_id=payload.get("universal_content_id"),
+        )
+    return payload, None
 
 
 def _error_response(message: str, **details: Any) -> dict:
@@ -387,7 +461,7 @@ def _fetch_template_for_usage(template_id: str) -> dict:
     response = get_klaviyo_client().Templates.get_template(
         template_id,
         additional_fields_template=["definition"],
-        fields_template=TEMPLATE_USAGE_FIELDS,
+        fields_template=TEMPLATE_USAGE_DETAIL_FIELDS,
     )
     clean_result(response["data"])
     return response["data"]
@@ -435,26 +509,6 @@ def _get_block_summaries(universal_content_ids: list[str]) -> list[dict]:
     return [_get_block_summary(universal_content_id) for universal_content_id in universal_content_ids]
 
 
-def _list_all_templates_for_usage() -> list[dict]:
-    templates: list[dict] = []
-    page_cursor: str | None = None
-
-    while True:
-        response = get_klaviyo_client().Templates.get_templates(
-            additional_fields_template=["definition"],
-            fields_template=TEMPLATE_USAGE_FIELDS,
-            page_cursor=page_cursor,
-        )
-        clean_result(response["data"])
-        templates.extend(response["data"])
-        next_link = response.get("links", {}).get("next")
-        if not next_link:
-            break
-        page_cursor = next_link
-
-    return templates
-
-
 def _list_all_email_campaigns_for_usage() -> list[dict]:
     campaigns: list[dict] = []
     page_cursor: str | None = None
@@ -491,56 +545,785 @@ def _get_template_id_for_campaign_message(campaign_message_id: str) -> str | Non
     return None
 
 
-def _templates_using_universal_content(universal_content_id: str) -> tuple[list[dict], int]:
-    templates = _list_all_templates_for_usage()
-    matched_templates: list[dict] = []
-    scanned_count = 0
+def _exception_message(error: Exception) -> str:
+    return str(error).strip() or error.__class__.__name__
 
-    for template in templates:
-        scanned_count += 1
-        usage = _extract_template_usage_details(template)
-        if universal_content_id in usage["universal_content_ids"]:
-            matched_templates.append(
-                {
-                    **usage["template"],
-                    "detection_sources": usage["detection_sources"],
-                }
+
+class UniversalContentRelationshipCache:
+    def __init__(self, refresh_interval_seconds: int = 300):
+        self.refresh_interval_seconds = refresh_interval_seconds
+        self._lock = RLock()
+        self._template_entries: dict[str, TemplateUsageCacheEntry] = {}
+        self._campaign_entries: dict[str, CampaignUsageCacheEntry] = {}
+        self._block_to_template_ids: dict[str, set[str]] = {}
+        self._template_to_campaign_refs: dict[str, list[dict[str, Any]]] = {}
+        self._templates_refreshed_at_monotonic: float = 0.0
+        self._campaigns_refreshed_at_monotonic: float = 0.0
+        self._background_thread_started = False
+
+    def _ensure_background_refresh_thread(self) -> None:
+        with self._lock:
+            if self._background_thread_started:
+                return
+            thread = Thread(
+                target=self._background_refresh_loop,
+                name="klaviyo-universal-content-cache-refresh",
+                daemon=True,
+            )
+            thread.start()
+            self._background_thread_started = True
+
+    def _background_refresh_loop(self) -> None:
+        while True:
+            try:
+                self.refresh_templates_index(force=False)
+                self.refresh_campaigns_index(force=False)
+            except Exception as error:
+                logger.warning(
+                    "Universal content relationship cache background refresh failed: %s",
+                    _exception_message(error),
+                )
+            sleep(self.refresh_interval_seconds)
+
+    def _is_stale(self, refreshed_at_monotonic: float) -> bool:
+        if refreshed_at_monotonic <= 0:
+            return True
+        return (monotonic() - refreshed_at_monotonic) >= self.refresh_interval_seconds
+
+    def _rebuild_template_indexes(self) -> None:
+        block_to_template_ids: dict[str, set[str]] = {}
+        for entry in self._template_entries.values():
+            if entry.error:
+                continue
+            for universal_content_id in entry.universal_content_ids:
+                block_to_template_ids.setdefault(universal_content_id, set()).add(
+                    entry.template_id
+                )
+        self._block_to_template_ids = block_to_template_ids
+
+    def _rebuild_campaign_indexes(self) -> None:
+        template_to_campaign_refs: dict[str, list[dict[str, Any]]] = {}
+        for entry in self._campaign_entries.values():
+            if entry.error:
+                continue
+            for reference in entry.references:
+                if reference.template_id is None:
+                    continue
+                template_to_campaign_refs.setdefault(reference.template_id, []).append(
+                    {
+                        "campaign": entry.summary,
+                        "campaign_message": reference.campaign_message,
+                    }
+                )
+        self._template_to_campaign_refs = template_to_campaign_refs
+
+    def _list_all_templates_metadata(self) -> list[dict]:
+        templates: list[dict] = []
+        page_cursor: str | None = None
+
+        while True:
+            response = get_klaviyo_client().Templates.get_templates(
+                fields_template=TEMPLATE_DISCOVERY_FIELDS,
+                page_cursor=page_cursor,
+            )
+            clean_result(response["data"])
+            templates.extend(response["data"])
+            next_link = response.get("links", {}).get("next")
+            if not next_link:
+                break
+            page_cursor = next_link
+
+        return templates
+
+    def _fetch_template_metadata_page(self, page_cursor: str | None) -> tuple[list[dict], str | None]:
+        response = get_klaviyo_client().Templates.get_templates(
+            fields_template=TEMPLATE_DISCOVERY_FIELDS,
+            page_cursor=page_cursor,
+        )
+        clean_result(response["data"])
+        next_link = response.get("links", {}).get("next")
+        return response["data"], next_link
+
+    def _refresh_template_entry(
+        self,
+        template_id: str,
+        metadata_template: dict[str, Any] | None = None,
+    ) -> TemplateUsageCacheEntry:
+        summary_hint = (
+            _template_summary(metadata_template)
+            if isinstance(metadata_template, dict)
+            else {"id": template_id}
+        )
+        updated_hint = summary_hint.get("updated")
+        refreshed_at = monotonic()
+
+        try:
+            template = _fetch_template_for_usage(template_id)
+            usage = _extract_template_usage_details(template)
+            entry = TemplateUsageCacheEntry(
+                template_id=template_id,
+                summary=usage["template"],
+                updated=usage["template"].get("updated"),
+                universal_content_ids=usage["universal_content_ids"],
+                detection_sources=usage["detection_sources"],
+                refreshed_at_monotonic=refreshed_at,
+                error=None,
+            )
+        except Exception as error:
+            entry = TemplateUsageCacheEntry(
+                template_id=template_id,
+                summary=summary_hint,
+                updated=updated_hint if isinstance(updated_hint, str) else None,
+                universal_content_ids=[],
+                detection_sources=[],
+                refreshed_at_monotonic=refreshed_at,
+                error=_exception_message(error),
             )
 
-    return matched_templates, scanned_count
+        self._template_entries[template_id] = entry
+        return entry
 
+    def refresh_templates_index(self, force: bool = False) -> None:
+        self._ensure_background_refresh_thread()
+        with self._lock:
+            if not force and not self._is_stale(self._templates_refreshed_at_monotonic):
+                return
 
-def _campaigns_using_template_ids(template_ids: set[str]) -> tuple[list[dict], list[dict], int]:
-    campaigns = _list_all_email_campaigns_for_usage()
-    matched_campaigns: list[dict] = []
-    matched_campaign_messages: list[dict] = []
-    seen_campaign_ids: set[str] = set()
-    scanned_messages = 0
+        templates = self._list_all_templates_metadata()
 
-    for campaign in campaigns:
+        with self._lock:
+            current_template_ids = set(self._template_entries.keys())
+            seen_template_ids: set[str] = set()
+
+            for template in templates:
+                template_id = template.get("id")
+                if not isinstance(template_id, str):
+                    continue
+                seen_template_ids.add(template_id)
+                summary = _template_summary(template)
+                updated = summary.get("updated")
+                existing = self._template_entries.get(template_id)
+                needs_refresh = (
+                    force
+                    or existing is None
+                    or existing.updated != updated
+                    or existing.error is not None
+                )
+                if needs_refresh:
+                    self._refresh_template_entry(template_id, metadata_template=template)
+                elif existing is not None:
+                    existing.summary = summary
+                    existing.updated = updated if isinstance(updated, str) else existing.updated
+
+            for removed_template_id in current_template_ids - seen_template_ids:
+                self._template_entries.pop(removed_template_id, None)
+
+            self._rebuild_template_indexes()
+            self._templates_refreshed_at_monotonic = monotonic()
+
+    def refresh_template(
+        self,
+        template_id: str,
+        force: bool = False,
+        metadata_template: dict[str, Any] | None = None,
+    ) -> TemplateUsageCacheEntry:
+        self._ensure_background_refresh_thread()
+        with self._lock:
+            existing = self._template_entries.get(template_id)
+            if (
+                existing is not None
+                and not force
+                and not self._is_stale(existing.refreshed_at_monotonic)
+            ):
+                return existing
+            entry = self._refresh_template_entry(template_id, metadata_template=metadata_template)
+            self._rebuild_template_indexes()
+            return entry
+
+    def _list_all_email_campaigns_metadata(self) -> list[dict]:
+        campaigns: list[dict] = []
+        page_cursor: str | None = None
+
+        while True:
+            response = get_klaviyo_client().Campaigns.get_campaigns(
+                fields_campaign=CAMPAIGN_USAGE_FIELDS,
+                filter=get_filter_string(
+                    [SimpleNamespace(field="messages.channel", operator="equals", value="email")]
+                ),
+                include=["campaign-messages"],
+                page_cursor=page_cursor,
+            )
+            add_related_data(response, "campaign-message", "campaign-messages")
+            clean_result(response["data"])
+            campaigns.extend(response["data"])
+            next_link = response.get("links", {}).get("next")
+            if not next_link:
+                break
+            page_cursor = next_link
+
+        return campaigns
+
+    def _fetch_email_campaigns_metadata_page(
+        self, page_cursor: str | None
+    ) -> tuple[list[dict], str | None]:
+        response = get_klaviyo_client().Campaigns.get_campaigns(
+            fields_campaign=CAMPAIGN_USAGE_FIELDS,
+            filter=get_filter_string(
+                [SimpleNamespace(field="messages.channel", operator="equals", value="email")]
+            ),
+            include=["campaign-messages"],
+            page_cursor=page_cursor,
+        )
+        add_related_data(response, "campaign-message", "campaign-messages")
+        clean_result(response["data"])
+        next_link = response.get("links", {}).get("next")
+        return response["data"], next_link
+
+    def _build_campaign_entry(self, campaign: dict[str, Any]) -> CampaignUsageCacheEntry:
+        campaign_id = campaign.get("id")
+        summary = _campaign_summary(campaign)
+        updated_at = summary.get("updated_at")
+        references: list[CampaignUsageReference] = []
         campaign_messages = campaign.get("campaign-messages", [])
-        if not isinstance(campaign_messages, list):
-            continue
-        for campaign_message in campaign_messages:
-            if not isinstance(campaign_message, dict):
-                continue
-            scanned_messages += 1
-            template_id = _get_template_id_for_campaign_message(campaign_message.get("id"))
-            if template_id is None or template_id not in template_ids:
-                continue
-            matched_campaign_messages.append(
+
+        if isinstance(campaign_messages, list):
+            for campaign_message in campaign_messages:
+                if not isinstance(campaign_message, dict):
+                    continue
+                campaign_message_summary = _campaign_message_summary(campaign_message)
+                campaign_message_id = campaign_message.get("id")
+                template_id = None
+                error_message = None
+                if isinstance(campaign_message_id, str):
+                    try:
+                        template_id = _get_template_id_for_campaign_message(campaign_message_id)
+                    except Exception as error:
+                        error_message = _exception_message(error)
+
+                references.append(
+                    CampaignUsageReference(
+                        campaign_message=campaign_message_summary,
+                        template_id=template_id,
+                        error=error_message,
+                    )
+                )
+
+        return CampaignUsageCacheEntry(
+            campaign_id=campaign_id,
+            summary=summary,
+            updated_at=updated_at if isinstance(updated_at, str) else None,
+            references=references,
+            refreshed_at_monotonic=monotonic(),
+            error=None,
+        )
+
+    def refresh_campaigns_index(self, force: bool = False) -> None:
+        self._ensure_background_refresh_thread()
+        with self._lock:
+            if not force and not self._is_stale(self._campaigns_refreshed_at_monotonic):
+                return
+
+        campaigns = self._list_all_email_campaigns_metadata()
+
+        with self._lock:
+            current_campaign_ids = set(self._campaign_entries.keys())
+            seen_campaign_ids: set[str] = set()
+
+            for campaign in campaigns:
+                campaign_id = campaign.get("id")
+                if not isinstance(campaign_id, str):
+                    continue
+                seen_campaign_ids.add(campaign_id)
+                summary = _campaign_summary(campaign)
+                updated_at = summary.get("updated_at")
+                existing = self._campaign_entries.get(campaign_id)
+                needs_refresh = (
+                    force
+                    or existing is None
+                    or existing.updated_at != updated_at
+                    or existing.error is not None
+                )
+                if needs_refresh:
+                    self._campaign_entries[campaign_id] = self._build_campaign_entry(campaign)
+                elif existing is not None:
+                    existing.summary = summary
+                    existing.updated_at = (
+                        updated_at if isinstance(updated_at, str) else existing.updated_at
+                    )
+
+            for removed_campaign_id in current_campaign_ids - seen_campaign_ids:
+                self._campaign_entries.pop(removed_campaign_id, None)
+
+            self._rebuild_campaign_indexes()
+            self._campaigns_refreshed_at_monotonic = monotonic()
+
+    def refresh_campaign(self, campaign_id: str, force: bool = False) -> CampaignUsageCacheEntry:
+        self._ensure_background_refresh_thread()
+        with self._lock:
+            existing = self._campaign_entries.get(campaign_id)
+            if (
+                existing is not None
+                and not force
+                and not self._is_stale(existing.refreshed_at_monotonic)
+            ):
+                return existing
+
+        response = get_klaviyo_client().Campaigns.get_campaign(
+            campaign_id,
+            include=["campaign-messages"],
+        )
+        add_related_data(response, "campaign-message", "campaign-messages")
+        clean_result(response["data"])
+        campaign_entry = self._build_campaign_entry(response["data"])
+
+        with self._lock:
+            self._campaign_entries[campaign_id] = campaign_entry
+            self._rebuild_campaign_indexes()
+        return campaign_entry
+
+    def _get_or_refresh_campaign_entry(
+        self, campaign: dict[str, Any], force: bool = False
+    ) -> CampaignUsageCacheEntry:
+        campaign_id = campaign.get("id")
+        if not isinstance(campaign_id, str):
+            raise ValueError("Campaign is missing a string id.")
+
+        with self._lock:
+            existing = self._campaign_entries.get(campaign_id)
+            summary = _campaign_summary(campaign)
+            updated_at = summary.get("updated_at")
+            if (
+                existing is not None
+                and not force
+                and not self._is_stale(existing.refreshed_at_monotonic)
+                and existing.updated_at == updated_at
+                and existing.error is None
+            ):
+                existing.summary = summary
+                return existing
+
+            entry = self._build_campaign_entry(campaign)
+            self._campaign_entries[campaign_id] = entry
+            self._rebuild_campaign_indexes()
+            return entry
+
+    def invalidate_all_templates(self) -> None:
+        with self._lock:
+            self._templates_refreshed_at_monotonic = 0.0
+
+    def invalidate_all_campaigns(self) -> None:
+        with self._lock:
+            self._campaigns_refreshed_at_monotonic = 0.0
+
+    def get_blocks_for_template(
+        self, template_id: str, force_refresh: bool = False
+    ) -> dict:
+        entry = self.refresh_template(template_id, force=force_refresh)
+        if entry.error:
+            return _error_response(
+                f"Failed to inspect template `{template_id}` while scanning for universal content usage.",
+                template_id=template_id,
+                details=entry.error,
+            )
+
+        return {
+            "relationship_type": "template_to_universal_content",
+            "template": entry.summary,
+            "universal_content_ids": entry.universal_content_ids,
+            "detection_sources": entry.detection_sources,
+            "stale": self._is_stale(entry.refreshed_at_monotonic),
+        }
+
+    def get_templates_using_block(
+        self, universal_content_id: str, force_refresh: bool = False
+    ) -> dict:
+        self.refresh_templates_index(force=force_refresh)
+        with self._lock:
+            template_ids = sorted(self._block_to_template_ids.get(universal_content_id, set()))
+            templates = [
                 {
-                    **_campaign_message_summary(campaign_message),
-                    "campaign_id": campaign.get("id"),
-                    "campaign_name": campaign.get("attributes", {}).get("name"),
-                    "template_id": template_id,
+                    **self._template_entries[template_id].summary,
+                    "detection_sources": self._template_entries[template_id].detection_sources,
+                }
+                for template_id in template_ids
+                if template_id in self._template_entries
+            ]
+            skipped_templates = [
+                {"id": entry.template_id, "error": entry.error}
+                for entry in self._template_entries.values()
+                if entry.error
+            ]
+            scanned_template_count = len(self._template_entries)
+
+        return {
+            "templates": templates,
+            "template_count": len(templates),
+            "scanned_template_count": scanned_template_count,
+            "skipped_templates": skipped_templates,
+            "warning": (
+                "Some templates could not be inspected and were skipped."
+                if skipped_templates
+                else None
+            ),
+        }
+
+    def get_templates_using_block_page(
+        self,
+        universal_content_id: str,
+        *,
+        page_size: int,
+        page_cursor: str | None,
+        force_refresh: bool,
+    ) -> dict:
+        self._ensure_background_refresh_thread()
+        cursor_payload, error = _decode_cursor(
+            page_cursor,
+            expected_kind="templates_using_universal_content",
+            expected_universal_content_id=universal_content_id,
+        )
+        if error:
+            return error
+
+        current_page_cursor = None if cursor_payload is None else cursor_payload.get("template_page_cursor")
+        current_offset = 0 if cursor_payload is None else int(cursor_payload.get("offset_in_page", 0))
+        scanned_templates = 0 if cursor_payload is None else int(cursor_payload.get("scanned_templates", 0))
+        warnings: list[dict[str, Any]] = []
+        matches: list[dict[str, Any]] = []
+        next_cursor: str | None = None
+
+        while len(matches) < page_size:
+            templates, next_link = self._fetch_template_metadata_page(current_page_cursor)
+            if current_offset >= len(templates):
+                if not next_link:
+                    break
+                current_page_cursor = next_link
+                current_offset = 0
+                continue
+
+            index = current_offset
+            while index < len(templates) and len(matches) < page_size:
+                template = templates[index]
+                template_id = template.get("id")
+                index += 1
+                if not isinstance(template_id, str):
+                    continue
+                scanned_templates += 1
+                entry = self.refresh_template(
+                    template_id,
+                    force=force_refresh,
+                    metadata_template=template,
+                )
+                if entry.error:
+                    warnings.append({"id": template_id, "error": entry.error})
+                    continue
+                if universal_content_id in entry.universal_content_ids:
+                    matches.append(
+                        {
+                            **entry.summary,
+                            "detection_sources": entry.detection_sources,
+                        }
+                    )
+
+            if len(matches) >= page_size:
+                if index < len(templates):
+                    next_cursor = _encode_cursor(
+                        {
+                            "kind": "templates_using_universal_content",
+                            "universal_content_id": universal_content_id,
+                            "template_page_cursor": current_page_cursor,
+                            "offset_in_page": index,
+                            "scanned_templates": scanned_templates,
+                        }
+                    )
+                elif next_link:
+                    next_cursor = _encode_cursor(
+                        {
+                            "kind": "templates_using_universal_content",
+                            "universal_content_id": universal_content_id,
+                            "template_page_cursor": next_link,
+                            "offset_in_page": 0,
+                            "scanned_templates": scanned_templates,
+                        }
+                    )
+                break
+
+            if not next_link:
+                break
+            current_page_cursor = next_link
+            current_offset = 0
+
+        return {
+            "templates": matches,
+            "returned_count": len(matches),
+            "page_size": page_size,
+            "next_cursor": next_cursor,
+            "scanned_templates": scanned_templates,
+            "warnings": warnings,
+            "skipped_templates": warnings,
+            "warning": (
+                "Some templates could not be inspected and were skipped."
+                if warnings
+                else None
+            ),
+        }
+
+    def get_blocks_for_campaign(
+        self, campaign_id: str, force_refresh: bool = False
+    ) -> dict:
+        campaign_entry = self.refresh_campaign(campaign_id, force=force_refresh)
+        template_usages: list[dict] = []
+        all_block_ids: set[str] = set()
+        skipped_templates: list[dict] = []
+
+        for reference in campaign_entry.references:
+            if reference.template_id is None:
+                continue
+            template_result = self.get_blocks_for_template(
+                reference.template_id, force_refresh=force_refresh
+            )
+            if template_result.get("ok") is False:
+                skipped_templates.append(
+                    {
+                        "id": reference.template_id,
+                        "error": template_result.get("error"),
+                        "details": template_result.get("details"),
+                    }
+                )
+                continue
+
+            all_block_ids.update(template_result["universal_content_ids"])
+            template_usages.append(
+                {
+                    "campaign_message": reference.campaign_message,
+                    "template": template_result["template"],
+                    "universal_content_ids": template_result["universal_content_ids"],
+                    "detection_sources": template_result["detection_sources"],
                 }
             )
-            if campaign.get("id") not in seen_campaign_ids:
-                seen_campaign_ids.add(campaign.get("id"))
-                matched_campaigns.append(_campaign_summary(campaign))
 
-    return matched_campaigns, matched_campaign_messages, scanned_messages
+        return {
+            "relationship_type": "campaign_to_universal_content",
+            "campaign": campaign_entry.summary,
+            "templates": template_usages,
+            "universal_content_ids": sorted(all_block_ids),
+            "skipped_templates": skipped_templates,
+            "warning": (
+                "Some templates could not be inspected and were skipped."
+                if skipped_templates
+                else None
+            ),
+        }
+
+    def get_campaigns_using_block(
+        self, universal_content_id: str, force_refresh: bool = False
+    ) -> dict:
+        templates_result = self.get_templates_using_block(
+            universal_content_id, force_refresh=force_refresh
+        )
+        self.refresh_campaigns_index(force=force_refresh)
+
+        with self._lock:
+            template_ids = {
+                template["id"]
+                for template in templates_result["templates"]
+                if isinstance(template.get("id"), str)
+            }
+            campaigns: list[dict] = []
+            campaign_messages: list[dict] = []
+            seen_campaign_ids: set[str] = set()
+
+            for template_id in template_ids:
+                for reference in self._template_to_campaign_refs.get(template_id, []):
+                    campaign = reference["campaign"]
+                    campaign_message = reference["campaign_message"]
+                    campaign_messages.append(
+                        {
+                            **campaign_message,
+                            "campaign_id": campaign.get("id"),
+                            "campaign_name": campaign.get("name"),
+                            "template_id": template_id,
+                        }
+                    )
+                    if campaign.get("id") not in seen_campaign_ids:
+                        seen_campaign_ids.add(campaign.get("id"))
+                        campaigns.append(campaign)
+
+            scanned_campaign_message_count = sum(
+                len(entry.references)
+                for entry in self._campaign_entries.values()
+                if entry.error is None
+            )
+
+        return {
+            "templates": templates_result["templates"],
+            "template_count": templates_result["template_count"],
+            "scanned_template_count": templates_result["scanned_template_count"],
+            "skipped_templates": templates_result["skipped_templates"],
+            "campaigns": campaigns,
+            "campaign_messages": campaign_messages,
+            "campaign_count": len(campaigns),
+            "campaign_message_count": len(campaign_messages),
+            "scanned_campaign_message_count": scanned_campaign_message_count,
+            "warning": (
+                "Some templates could not be inspected and were skipped."
+                if templates_result["skipped_templates"]
+                else None
+            ),
+        }
+
+    def get_campaigns_using_block_page(
+        self,
+        universal_content_id: str,
+        *,
+        page_size: int,
+        page_cursor: str | None,
+        force_refresh: bool,
+    ) -> dict:
+        self._ensure_background_refresh_thread()
+        cursor_payload, error = _decode_cursor(
+            page_cursor,
+            expected_kind="campaigns_using_universal_content",
+            expected_universal_content_id=universal_content_id,
+        )
+        if error:
+            return error
+
+        current_page_cursor = None if cursor_payload is None else cursor_payload.get("campaign_page_cursor")
+        current_offset = 0 if cursor_payload is None else int(cursor_payload.get("offset_in_page", 0))
+        scanned_campaigns = 0 if cursor_payload is None else int(cursor_payload.get("scanned_campaigns", 0))
+        scanned_campaign_messages = (
+            0 if cursor_payload is None else int(cursor_payload.get("scanned_campaign_messages", 0))
+        )
+
+        warnings: list[dict[str, Any]] = []
+        campaigns: list[dict[str, Any]] = []
+        campaign_messages: list[dict[str, Any]] = []
+        templates: list[dict[str, Any]] = []
+        seen_campaign_ids: set[str] = set()
+        seen_template_ids: set[str] = set()
+        next_cursor: str | None = None
+
+        while len(campaigns) < page_size:
+            campaign_page, next_link = self._fetch_email_campaigns_metadata_page(current_page_cursor)
+            if current_offset >= len(campaign_page):
+                if not next_link:
+                    break
+                current_page_cursor = next_link
+                current_offset = 0
+                continue
+
+            index = current_offset
+            while index < len(campaign_page) and len(campaigns) < page_size:
+                campaign = campaign_page[index]
+                index += 1
+                campaign_id = campaign.get("id")
+                if not isinstance(campaign_id, str):
+                    continue
+                scanned_campaigns += 1
+                campaign_entry = self._get_or_refresh_campaign_entry(
+                    campaign, force=force_refresh
+                )
+
+                matched_for_campaign = False
+                for reference in campaign_entry.references:
+                    scanned_campaign_messages += 1
+                    if reference.template_id is None:
+                        if reference.error:
+                            warnings.append(
+                                {
+                                    "campaign_id": campaign_id,
+                                    "campaign_message_id": reference.campaign_message.get("id"),
+                                    "error": reference.error,
+                                }
+                            )
+                        continue
+                    template_entry = self.refresh_template(
+                        reference.template_id,
+                        force=force_refresh,
+                    )
+                    if template_entry.error:
+                        warnings.append(
+                            {
+                                "campaign_id": campaign_id,
+                                "template_id": reference.template_id,
+                                "error": template_entry.error,
+                            }
+                        )
+                        continue
+                    if universal_content_id not in template_entry.universal_content_ids:
+                        continue
+
+                    matched_for_campaign = True
+                    campaign_messages.append(
+                        {
+                            **reference.campaign_message,
+                            "campaign_id": campaign_entry.summary.get("id"),
+                            "campaign_name": campaign_entry.summary.get("name"),
+                            "template_id": reference.template_id,
+                        }
+                    )
+                    if reference.template_id not in seen_template_ids:
+                        seen_template_ids.add(reference.template_id)
+                        templates.append(
+                            {
+                                **template_entry.summary,
+                                "detection_sources": template_entry.detection_sources,
+                            }
+                        )
+
+                if matched_for_campaign and campaign_id not in seen_campaign_ids:
+                    seen_campaign_ids.add(campaign_id)
+                    campaigns.append(campaign_entry.summary)
+
+            if len(campaigns) >= page_size:
+                if index < len(campaign_page):
+                    next_cursor = _encode_cursor(
+                        {
+                            "kind": "campaigns_using_universal_content",
+                            "universal_content_id": universal_content_id,
+                            "campaign_page_cursor": current_page_cursor,
+                            "offset_in_page": index,
+                            "scanned_campaigns": scanned_campaigns,
+                            "scanned_campaign_messages": scanned_campaign_messages,
+                        }
+                    )
+                elif next_link:
+                    next_cursor = _encode_cursor(
+                        {
+                            "kind": "campaigns_using_universal_content",
+                            "universal_content_id": universal_content_id,
+                            "campaign_page_cursor": next_link,
+                            "offset_in_page": 0,
+                            "scanned_campaigns": scanned_campaigns,
+                            "scanned_campaign_messages": scanned_campaign_messages,
+                        }
+                    )
+                break
+
+            if not next_link:
+                break
+            current_page_cursor = next_link
+            current_offset = 0
+
+        return {
+            "campaigns": campaigns,
+            "campaign_messages": campaign_messages,
+            "templates": templates,
+            "returned_count": len(campaigns),
+            "page_size": page_size,
+            "next_cursor": next_cursor,
+            "scanned_campaigns": scanned_campaigns,
+            "scanned_campaign_messages": scanned_campaign_messages,
+            "warnings": warnings,
+            "warning": (
+                "Some templates or campaign-message template lookups failed and were skipped."
+                if warnings
+                else None
+            ),
+        }
+
+
+relationship_cache = UniversalContentRelationshipCache()
 
 
 @mcp_tool(has_writes=False)
@@ -869,6 +1652,8 @@ def delete_universal_content_block(
         return error
 
     get_klaviyo_client().Templates.delete_universal_content(universal_content_id_value)
+    relationship_cache.invalidate_all_templates()
+    relationship_cache.invalidate_all_campaigns()
     return {"id": universal_content_id_value, "deleted": True}
 
 
@@ -926,6 +1711,15 @@ def get_universal_content_blocks_for_template(
             )
         ),
     ] = True,
+    force_refresh: Annotated[
+        Any,
+        Field(
+            description=(
+                "If true, force a fresh relationship scan for this template instead of using the "
+                "cached relationship index."
+            )
+        ),
+    ] = False,
 ) -> dict:
     """Get the universal content blocks referenced by a template.
 
@@ -941,15 +1735,19 @@ def get_universal_content_blocks_for_template(
         return error
     if include_block_details_value is None:
         include_block_details_value = True
+    force_refresh_value, error = _coerce_bool(force_refresh, "force_refresh")
+    if error:
+        return error
+    if force_refresh_value is None:
+        force_refresh_value = False
 
-    template = _fetch_template_for_usage(template_id_value)
-    usage = _extract_template_usage_details(template)
-    response = {
-        **usage,
-        "relationship_type": "template_to_universal_content",
-    }
+    response = relationship_cache.get_blocks_for_template(
+        template_id_value, force_refresh=force_refresh_value
+    )
+    if response.get("ok") is False:
+        return response
     if include_block_details_value:
-        response["universal_content_blocks"] = _get_block_summaries(usage["universal_content_ids"])
+        response["universal_content_blocks"] = _get_block_summaries(response["universal_content_ids"])
     return response
 
 
@@ -970,6 +1768,15 @@ def get_universal_content_blocks_for_campaign(
             )
         ),
     ] = True,
+    force_refresh: Annotated[
+        Any,
+        Field(
+            description=(
+                "If true, force a fresh relationship scan for this campaign instead of using the "
+                "cached relationship index."
+            )
+        ),
+    ] = False,
 ) -> dict:
     """Get the universal content blocks referenced by an email campaign.
 
@@ -985,47 +1792,17 @@ def get_universal_content_blocks_for_campaign(
         return error
     if include_block_details_value is None:
         include_block_details_value = True
+    force_refresh_value, error = _coerce_bool(force_refresh, "force_refresh")
+    if error:
+        return error
+    if force_refresh_value is None:
+        force_refresh_value = False
 
-    campaign = get_klaviyo_client().Campaigns.get_campaign(
-        campaign_id_value,
-        include=["campaign-messages"],
+    response = relationship_cache.get_blocks_for_campaign(
+        campaign_id_value, force_refresh=force_refresh_value
     )
-    add_related_data(campaign, "campaign-message", "campaign-messages")
-    clean_result(campaign["data"])
-    campaign_data = campaign["data"]
-    campaign_messages = campaign_data.get("campaign-messages", [])
-    if not isinstance(campaign_messages, list):
-        campaign_messages = []
-
-    template_usages: list[dict] = []
-    all_block_ids: set[str] = set()
-    for campaign_message in campaign_messages:
-        if not isinstance(campaign_message, dict):
-            continue
-        campaign_message_id = campaign_message.get("id")
-        if not isinstance(campaign_message_id, str):
-            continue
-        template_id = _get_template_id_for_campaign_message(campaign_message_id)
-        if template_id is None:
-            continue
-        template = _fetch_template_for_usage(template_id)
-        usage = _extract_template_usage_details(template)
-        all_block_ids.update(usage["universal_content_ids"])
-        template_usages.append(
-            {
-                "campaign_message": _campaign_message_summary(campaign_message),
-                **usage,
-            }
-        )
-
-    response = {
-        "relationship_type": "campaign_to_universal_content",
-        "campaign": _campaign_summary(campaign_data),
-        "templates": template_usages,
-        "universal_content_ids": sorted(all_block_ids),
-    }
     if include_block_details_value:
-        response["universal_content_blocks"] = _get_block_summaries(sorted(all_block_ids))
+        response["universal_content_blocks"] = _get_block_summaries(response["universal_content_ids"])
     return response
 
 
@@ -1037,10 +1814,37 @@ def get_templates_using_universal_content_block(
             description="The universal content block ID whose template usage should be discovered."
         ),
     ] = None,
+    force_refresh: Annotated[
+        Any,
+        Field(
+            description=(
+                "If true, force a fresh reverse-usage scan instead of using the cached "
+                "relationship index."
+            )
+        ),
+    ] = False,
+    page_size: Annotated[
+        Any,
+        Field(
+            description=(
+                "Maximum number of matching templates to return in this page. Use a small number "
+                "such as 10 or 20 to keep responses compact."
+            )
+        ),
+    ] = 20,
+    page_cursor: Annotated[
+        Any,
+        Field(
+            description=(
+                "Opaque pagination cursor returned by a previous call to this tool. Omit on the "
+                "first request."
+            )
+        ),
+    ] = None,
 ) -> dict:
     """Get all templates currently using a universal content block.
 
-    This is a derived reverse-relationship tool. It scans template HTML and editor definitions to find where a universal content block is referenced."""
+    This is a derived reverse-relationship tool. Results are paged. It scans template HTML and editor definitions to find where a universal content block is referenced."""
     universal_content_id_value, error = _coerce_string(universal_content_id, "universal_content_id")
     if error:
         return error
@@ -1052,14 +1856,31 @@ def get_templates_using_universal_content_block(
     if error:
         return error
 
-    templates, scanned_count = _templates_using_universal_content(universal_content_id_value)
+    force_refresh_value, error = _coerce_bool(force_refresh, "force_refresh")
+    if error:
+        return error
+    if force_refresh_value is None:
+        force_refresh_value = False
+    page_size_value, error = _coerce_page_size(page_size)
+    if error:
+        return error
+    if page_size_value is None:
+        page_size_value = 20
+    page_cursor_value, error = _coerce_string(page_cursor, "page_cursor")
+    if error:
+        return error
+
     block_summary = _get_block_summary(universal_content_id_value)
+    usage = relationship_cache.get_templates_using_block_page(
+        universal_content_id_value,
+        page_size=page_size_value,
+        page_cursor=page_cursor_value,
+        force_refresh=force_refresh_value,
+    )
     return {
         "relationship_type": "universal_content_to_templates",
         "universal_content_block": block_summary,
-        "templates": templates,
-        "template_count": len(templates),
-        "scanned_template_count": scanned_count,
+        **usage,
     }
 
 
@@ -1071,10 +1892,37 @@ def get_campaigns_using_universal_content_block(
             description="The universal content block ID whose campaign usage should be discovered."
         ),
     ] = None,
+    force_refresh: Annotated[
+        Any,
+        Field(
+            description=(
+                "If true, force a fresh reverse-usage scan instead of using the cached "
+                "relationship index."
+            )
+        ),
+    ] = False,
+    page_size: Annotated[
+        Any,
+        Field(
+            description=(
+                "Maximum number of matching campaigns to return in this page. Use a small number "
+                "such as 10 or 20 to keep responses compact."
+            )
+        ),
+    ] = 20,
+    page_cursor: Annotated[
+        Any,
+        Field(
+            description=(
+                "Opaque pagination cursor returned by a previous call to this tool. Omit on the "
+                "first request."
+            )
+        ),
+    ] = None,
 ) -> dict:
     """Get all email campaigns currently using a universal content block.
 
-    This is a derived reverse-relationship tool. It first finds matching templates, then traverses email campaign messages back to their parent campaigns."""
+    This is a derived reverse-relationship tool. Results are paged. It first finds matching templates, then traverses email campaign messages back to their parent campaigns."""
     universal_content_id_value, error = _coerce_string(universal_content_id, "universal_content_id")
     if error:
         return error
@@ -1086,19 +1934,29 @@ def get_campaigns_using_universal_content_block(
     if error:
         return error
 
-    templates, scanned_template_count = _templates_using_universal_content(universal_content_id_value)
-    template_ids = {template["id"] for template in templates if isinstance(template.get("id"), str)}
-    campaigns, campaign_messages, scanned_campaign_message_count = _campaigns_using_template_ids(template_ids)
+    force_refresh_value, error = _coerce_bool(force_refresh, "force_refresh")
+    if error:
+        return error
+    if force_refresh_value is None:
+        force_refresh_value = False
+    page_size_value, error = _coerce_page_size(page_size)
+    if error:
+        return error
+    if page_size_value is None:
+        page_size_value = 20
+    page_cursor_value, error = _coerce_string(page_cursor, "page_cursor")
+    if error:
+        return error
+
     block_summary = _get_block_summary(universal_content_id_value)
+    usage = relationship_cache.get_campaigns_using_block_page(
+        universal_content_id_value,
+        page_size=page_size_value,
+        page_cursor=page_cursor_value,
+        force_refresh=force_refresh_value,
+    )
     return {
         "relationship_type": "universal_content_to_campaigns",
         "universal_content_block": block_summary,
-        "templates": templates,
-        "campaign_messages": campaign_messages,
-        "campaigns": campaigns,
-        "template_count": len(templates),
-        "campaign_message_count": len(campaign_messages),
-        "campaign_count": len(campaigns),
-        "scanned_template_count": scanned_template_count,
-        "scanned_campaign_message_count": scanned_campaign_message_count,
+        **usage,
     }

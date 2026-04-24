@@ -61,6 +61,8 @@ Relationship helpers are also available:
 - universal content block -> templates using it
 - universal content block -> campaigns using it
 
+Reverse-usage relationship tools are paged so they can handle larger accounts without returning oversized responses.
+
 ## Authentication
 
 Identical to the official local server: private API key via the `PRIVATE_API_KEY` environment variable. This fork does **not** provide OAuth or any remote hosting — OAuth is Klaviyo's own gateway at `https://mcp.klaviyo.com/mcp` and is not part of the open-source package.
@@ -87,7 +89,7 @@ uvx --from klaviyo-mcp-server-extended klaviyo-mcp-server
 Pin the release version for reproducible MCP client configs:
 
 ```bash
-uvx --from klaviyo-mcp-server-extended==0.4.2 klaviyo-mcp-server
+uvx --from klaviyo-mcp-server-extended==0.4.6 klaviyo-mcp-server
 ```
 
 ### From a local wheel
@@ -101,12 +103,12 @@ uv build
 Then run the generated wheel from `dist/`:
 
 ```bash
-uvx --from ./dist/klaviyo_mcp_server_extended-0.4.2-py3-none-any.whl klaviyo-mcp-server
+uvx --from ./dist/klaviyo_mcp_server_extended-0.4.6-py3-none-any.whl klaviyo-mcp-server
 ```
 
 ### MCP client config (Claude Desktop, Cursor, VS Code)
 
-Replace the official `uvx klaviyo-mcp-server@latest` invocation with `uvx --from klaviyo-mcp-server-extended==0.4.2 klaviyo-mcp-server`. For example, in Claude Desktop:
+Replace the official `uvx klaviyo-mcp-server@latest` invocation with `uvx --from klaviyo-mcp-server-extended==0.4.6 klaviyo-mcp-server`. For example, in Claude Desktop:
 
 ```json
 {
@@ -115,7 +117,7 @@ Replace the official `uvx klaviyo-mcp-server@latest` invocation with `uvx --from
       "command": "uvx",
       "args": [
         "--from",
-        "klaviyo-mcp-server-extended==0.4.2",
+        "klaviyo-mcp-server-extended==0.4.6",
         "klaviyo-mcp-server"
       ],
       "env": {
@@ -137,7 +139,7 @@ After restarting your MCP client, your tool list should include the six new tool
 ## Upstream relationship
 
 - Based on `klaviyo-mcp-server==0.4.1` from PyPI (published 2026-03-05)
-- Version `0.4.2`, based on the upstream `0.4.1` base plus the six added tools
+- Version `0.4.6`, based on the upstream `0.4.1` base plus added campaign/template traversal, universal content, relationship, cache, and paged reverse-usage support
 - No changes to existing tools, models, utilities, prompts, or scripts
 - The added tools are the only diff
 
